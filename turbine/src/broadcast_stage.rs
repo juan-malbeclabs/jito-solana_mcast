@@ -26,7 +26,10 @@ use {
     solana_ledger::{blockstore::Blockstore, shred::Shred},
     solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
-    solana_net_utils::SocketAddrSpace,
+    solana_net_utils::{
+        SocketAddrSpace,
+        sockets::{bind_to_with_config, SocketConfiguration},
+    },
     solana_poh::poh_recorder::WorkingBankEntry,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::MAX_LEADER_SCHEDULE_STAKES, bank_forks::BankForks},
@@ -34,7 +37,7 @@ use {
     solana_time_utils::{AtomicInterval, timestamp},
     std::{
         collections::{HashMap, HashSet},
-        net::{SocketAddr, UdpSocket},
+        net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::{
             Arc, Mutex, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -219,6 +222,11 @@ trait BroadcastRun {
         shredstream_receiver_address: &ArcSwap<Option<SocketAddr>>,
         shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
         multicast_receiver_address: &ArcSwap<Option<SocketAddr>>,
+        // Dedicated socket bound to 0.0.0.0:0 used only for ShredReceiverAddresses and
+        // multicast_receiver_address. Kept separate from the main broadcast socket so the
+        // OS routing table (not --bind-address) selects the outbound interface per destination.
+        // Not used in the XDP path — the XDP Router resolves routes from the kernel table directly.
+        shred_receiver_socket: &UdpSocket,
     ) -> Result<()>;
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()>;
 }
@@ -343,6 +351,23 @@ impl BroadcastStage {
                 .unwrap()
         };
         let mut thread_hdls = vec![thread_hdl];
+
+        // Dedicated socket for ShredReceiverAddresses and multicast_receiver_address.
+        // Bound to 0.0.0.0:0 (not --bind-address) so the OS routing table selects the
+        // correct outbound interface per destination, regardless of which interface Turbine
+        // uses for its main broadcast traffic.
+        let shred_receiver_socket = Arc::new(
+            bind_to_with_config(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+                SocketConfiguration::default(),
+            )
+            .expect("bind shred_receiver_socket 0.0.0.0:0"),
+        );
+        shred_receiver_socket
+            .set_multicast_ttl_v4(64)
+            .expect("set multicast ttl");
+
         let num_broadcast_sockets_per_interface = socks.len() / cluster_info.bind_ip_addrs().len();
         let num_interfaces: usize = cluster_info.bind_ip_addrs().len();
 
@@ -379,6 +404,7 @@ impl BroadcastStage {
             let shredstream_receiver_address = shredstream_receiver_address.clone();
             let shred_receiver_addresses = shred_receiver_addresses.clone();
             let multicast_receiver_address = multicast_receiver_address.clone();
+            let shred_receiver_socket = shred_receiver_socket.clone();
 
             let run_transmit = move || loop {
                 let sock_variant = match xdp_sender.as_ref() {
@@ -397,6 +423,7 @@ impl BroadcastStage {
                     &shredstream_receiver_address,
                     &shred_receiver_addresses,
                     &multicast_receiver_address,
+                    &shred_receiver_socket,
                 );
                 if let Some(res) = Self::handle_error(res, "solana-broadcaster-transmit") {
                     return res;
@@ -520,6 +547,7 @@ pub enum BroadcastSocket<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn broadcast_shreds(
     socket: BroadcastSocket,
+    shred_receiver_socket: &UdpSocket,
     shreds: &[Shred],
     cluster_nodes_cache: &ClusterNodesCache<BroadcastStage>,
     last_datapoint_submit: &AtomicInterval,
@@ -562,26 +590,42 @@ pub fn broadcast_shreds(
     // Forward shreds to external receivers, avoiding duplicates when addresses
     // overlap. Add the cluster multicast address only when the route is present
     // and the address is not already added.
+    //
+    // Send each shred to all receivers before moving to the next shred, so that
+    // no receiver has a structural latency advantage based on its position in
+    // the address list.
     if let Some(addr) = shredstream_receiver_address {
-        packets.extend(shreds.iter().map(|shred| (shred.payload(), *addr)));
+        for shred in shreds.iter() {
+            packets.push((shred.payload(), *addr));
+        }
     }
-    let external_receiver_addrs = shred_receiver_addresses
+    // ShredReceiverAddresses and multicast_receiver_address are external receivers that may be
+    // reachable via a different interface than --bind-address. They are collected separately so
+    // they can be sent through the right path:
+    //   - UDP path: shred_receiver_socket (0.0.0.0:0), letting the kernel pick the interface.
+    //   - XDP path: XDP sender, which uses its own Router (fed from the kernel routing table via
+    //               netlink) to resolve the correct next-hop and interface per destination.
+    let external_receiver_addrs: Vec<_> = shred_receiver_addresses
         .iter()
         .chain(multicast_receiver_address.iter().filter(|addr| {
             !shred_receiver_addresses.contains(addr)
                 && shred_receiver_addresses.len() < MAX_SHRED_RECEIVER_ADDRESSES
         }))
-        .filter(|addr| Some(**addr) != *shredstream_receiver_address);
-    for &addr in external_receiver_addrs {
-        packets.extend(shreds.iter().map(|shred| (shred.payload(), addr)));
+        .filter(|addr| Some(**addr) != *shredstream_receiver_address)
+        .copied()
+        .collect();
+    let mut external_packets = Vec::with_capacity(shreds.len() * external_receiver_addrs.len());
+    for shred in shreds.iter() {
+        external_packets.extend(external_receiver_addrs.iter().map(|&addr| (shred.payload(), addr)));
     }
 
     shred_select.stop();
     transmit_stats.shred_select += shred_select.as_us();
-    let num_udp_packets = packets.len();
+    let num_udp_packets = packets.len() + external_packets.len();
     match socket {
         BroadcastSocket::Udp(s) => {
             let mut send_mmsg_time = Measure::start("send_mmsg");
+            // Turbine tree + shredstream: use the main socket (bound to --bind-address).
             match batch_send(s, packets) {
                 Ok(()) => (),
                 Err(SendPktsError::IoError(ioerr, num_failed)) => {
@@ -589,12 +633,29 @@ pub fn broadcast_shreds(
                     result = Err(Error::Io(ioerr));
                 }
             }
+            // External receivers: use the dedicated 0.0.0.0:0 socket so the kernel routing
+            // table picks the correct outbound interface, independent of --bind-address.
+            if !external_packets.is_empty() {
+                match batch_send(shred_receiver_socket, external_packets) {
+                    Ok(()) => (),
+                    Err(SendPktsError::IoError(ioerr, num_failed)) => {
+                        transmit_stats.dropped_packets_udp += num_failed;
+                        if result.is_ok() {
+                            result = Err(Error::Io(ioerr));
+                        }
+                    }
+                }
+            }
             send_mmsg_time.stop();
             transmit_stats.send_mmsg_elapsed += send_mmsg_time.as_us();
         }
         BroadcastSocket::Xdp(s) => {
             let mut send_xdp_time = Measure::start("send_xdp");
-            for (idx, (payload, addr)) in packets.into_iter().enumerate() {
+            // Turbine tree, shredstream, and external receivers all go through XDP.
+            // The XDP Router performs route_v4() per destination using the kernel routing
+            // table (read via netlink), so it resolves the correct interface and next-hop
+            // for each address, including those reachable via interfaces other than --bind-address.
+            for (idx, (payload, addr)) in packets.into_iter().chain(external_packets).enumerate() {
                 if let Err(e) = s.try_send(idx, addr, payload.bytes.clone()) {
                     log::warn!("xdp channel full: {e:?}");
                     transmit_stats.dropped_packets_xdp += 1;
