@@ -14,7 +14,7 @@ use {
         MAX_DATA_SHREDS_PER_SLOT,
     },
     solana_time_utils::AtomicInterval,
-    std::{borrow::Cow, net::SocketAddr, sync::RwLock},
+    std::{borrow::Cow, net::{SocketAddr, UdpSocket}, sync::RwLock},
     tokio::sync::mpsc::Sender as AsyncSender,
 };
 
@@ -178,6 +178,8 @@ impl StandardBroadcastRun {
             &mut ProcessShredsStats::default(),
         )?;
         // Data and coding shreds are sent in a single batch.
+        let shred_receiver_socket =
+            UdpSocket::bind("0.0.0.0:0").expect("bind shred_receiver_socket");
         let _ = self.transmit(
             &srecv,
             cluster_info,
@@ -187,6 +189,7 @@ impl StandardBroadcastRun {
             &ArcSwap::default(),
             &ArcSwap::default(),
             &ArcSwap::default(),
+            &shred_receiver_socket,
         );
         let _ = self.record(&brecv, blockstore);
         Ok(())
@@ -388,6 +391,7 @@ impl StandardBroadcastRun {
         bank_forks: &RwLock<BankForks>,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
         external_receivers: ExternalBroadcastReceivers<'_>,
+        shred_receiver_socket: &UdpSocket,
     ) -> Result<()> {
         trace!("Broadcasting {:?} shreds", shreds.len());
         let mut transmit_stats = TransmitShredsStats {
@@ -412,6 +416,7 @@ impl StandardBroadcastRun {
             external_receivers.shredstream_receiver_address,
             external_receivers.shred_receiver_addresses,
             external_receivers.multicast_receiver_address,
+            shred_receiver_socket,
         )?;
         transmit_time.stop();
 
@@ -482,6 +487,7 @@ impl BroadcastRun for StandardBroadcastRun {
         shredstream_receiver_address: &ArcSwap<Option<SocketAddr>>,
         shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
         multicast_receiver_address: &ArcSwap<Option<SocketAddr>>,
+        shred_receiver_socket: &UdpSocket,
     ) -> Result<()> {
         let (shreds, batch_info) = receiver.recv()?;
         self.broadcast(
@@ -496,6 +502,7 @@ impl BroadcastRun for StandardBroadcastRun {
                 shred_receiver_addresses: &shred_receiver_addresses.load(),
                 multicast_receiver_address: &multicast_receiver_address.load(),
             },
+            shred_receiver_socket,
         )
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {
