@@ -569,12 +569,13 @@ pub fn broadcast_shreds(
     if let Some(addr) = shredstream_receiver_address {
         packets.extend(shreds.iter().map(|shred| (shred.payload(), *addr)));
     }
-    let external_receiver_addrs = shred_receiver_addresses
+    let external_receiver_addrs = multicast_receiver_address
         .iter()
-        .chain(multicast_receiver_address.iter().filter(|addr| {
+        .filter(|addr| {
             !shred_receiver_addresses.contains(addr)
                 && shred_receiver_addresses.len() < MAX_SHRED_RECEIVER_ADDRESSES
-        }))
+        })
+        .chain(shred_receiver_addresses.iter())
         .filter(|addr| Some(**addr) != *shredstream_receiver_address);
     for &addr in external_receiver_addrs {
         packets.extend(shreds.iter().map(|shred| (shred.payload(), addr)));
