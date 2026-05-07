@@ -18,7 +18,11 @@ use {
             tower_storage::{NullTowerStorage, TowerStorage},
         },
         forwarding_stage::ForwardingClientConfig,
-        multicast_shred_check_service::MulticastShredCheckService,
+        multicast_shred_check_service::{
+            MULTICAST_ROOT_SHRED_ADDR_MAINNET, MULTICAST_ROOT_SHRED_ADDR_TESTNET,
+            MULTICAST_SHRED_ADDR_MAINNET, MULTICAST_SHRED_ADDR_TESTNET,
+            MulticastShredCheckService,
+        },
         proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         repair::{
             self,
@@ -665,9 +669,15 @@ pub struct Validator {
     transaction_status_service: Option<TransactionStatusService>,
     entry_notifier_service: Option<EntryNotifierService>,
     system_monitor_service: Option<SystemMonitorService>,
-    /// Background watcher that keeps the cluster multicast shred address in sync
-    /// with kernel route availability.
-    multicast_shred_check_service: Option<MulticastShredCheckService>,
+    /// Background watchers that keep the cluster multicast shred addresses in
+    /// sync with kernel route availability. One per multicast destination
+    /// (leader broadcast and retransmit root forwarding). Empty on cluster
+    /// types that do not advertise a multicast group.
+    multicast_shred_check_services: Vec<MulticastShredCheckService>,
+    /// Netlink-driven thread that keeps a snapshot of the kernel route table for
+    /// the multicast root receiver feature. `None` on non-Linux or when the
+    /// feature is disabled.
+    route_monitor_handle: Option<JoinHandle<()>>,
     sample_performance_service: Option<SamplePerformanceService>,
     stats_reporter_service: StatsReporterService,
     gossip_service: GossipService,
@@ -1630,6 +1640,15 @@ impl Validator {
                 (None, None)
             };
 
+        let (route_monitor_handle, leader_route_check) = spawn_leader_route_check(exit.clone());
+
+        // Multicast destination used by the retransmit stage when this validator is
+        // turbine root for a slot whose leader is not reachable via a specific
+        // kernel route. Updated by a `MulticastShredCheckService`, read by the
+        // retransmit stage. Internal to validator setup — no external consumer.
+        let multicast_root_receiver_address: Arc<ArcSwap<Option<SocketAddr>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+
         // disable all2all tests if not allowed for a given cluster type
         let alpenglow_socket = if genesis_config.cluster_type == ClusterType::Testnet
             || genesis_config.cluster_type == ClusterType::Development
@@ -1686,6 +1705,8 @@ impl Validator {
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
+                multicast_root_receiver_address: multicast_root_receiver_address.clone(),
+                leader_route_check: leader_route_check.clone(),
             },
             &max_slots,
             block_metadata_notifier,
@@ -1835,18 +1856,35 @@ impl Validator {
             shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
         });
 
-        let multicast_shred_check_service = (!config.disable_multicast_shred_check
+        let multicast_shred_check_services = if !config.disable_multicast_shred_check
             && matches!(
                 genesis_config.cluster_type,
                 ClusterType::MainnetBeta | ClusterType::Testnet
-            ))
-        .then(|| {
-            MulticastShredCheckService::new(
-                exit.clone(),
-                config.multicast_receiver_address.clone(),
-                genesis_config.cluster_type,
-            )
-        });
+            ) {
+            let (leader_addr, root_addr) = match genesis_config.cluster_type {
+                ClusterType::Testnet => {
+                    (MULTICAST_SHRED_ADDR_TESTNET, MULTICAST_ROOT_SHRED_ADDR_TESTNET)
+                }
+                _ => (
+                    MULTICAST_SHRED_ADDR_MAINNET,
+                    MULTICAST_ROOT_SHRED_ADDR_MAINNET,
+                ),
+            };
+            vec![
+                MulticastShredCheckService::new(
+                    exit.clone(),
+                    config.multicast_receiver_address.clone(),
+                    leader_addr,
+                ),
+                MulticastShredCheckService::new(
+                    exit.clone(),
+                    multicast_root_receiver_address.clone(),
+                    root_addr,
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             logfile: config.logfile.clone(),
@@ -1861,7 +1899,8 @@ impl Validator {
             transaction_status_service,
             entry_notifier_service,
             system_monitor_service,
-            multicast_shred_check_service,
+            multicast_shred_check_services,
+            route_monitor_handle,
             sample_performance_service,
             snapshot_packager_service,
             completed_data_sets_service,
@@ -2015,10 +2054,14 @@ impl Validator {
                 .expect("system_monitor_service");
         }
 
-        if let Some(multicast_shred_check_service) = self.multicast_shred_check_service {
+        for multicast_shred_check_service in self.multicast_shred_check_services {
             multicast_shred_check_service
                 .join()
                 .expect("multicast_shred_check_service");
+        }
+
+        if let Some(route_monitor_handle) = self.route_monitor_handle {
+            route_monitor_handle.join().expect("route_monitor_handle");
         }
 
         if let Some(sample_performance_service) = self.sample_performance_service {
@@ -2078,6 +2121,46 @@ impl Validator {
             geyser_plugin_service.join().expect("geyser_plugin_service");
         }
     }
+}
+
+/// Spawns the netlink-driven [`RouteMonitor`] and returns a closure that
+/// reports whether an IP is covered by a kernel route with a non-zero prefix
+/// length. The retransmit stage uses it to gate the multicast root receiver
+/// feature. Returns `(None, None)` on non-Linux or when the route table cannot
+/// be read.
+#[cfg(target_os = "linux")]
+fn spawn_leader_route_check(
+    exit: Arc<AtomicBool>,
+) -> (Option<JoinHandle<()>>, Option<solana_turbine::LeaderRouteCheck>) {
+    use {
+        agave_xdp::{route::Router, route_monitor::RouteMonitor},
+        std::time::Duration,
+    };
+
+    let router = match Router::new().and_then(|mut r| r.build_caches().map(|_| r)) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!("multicast_root_receiver: route table init failed; disabled: {err}");
+            return (None, None);
+        }
+    };
+    let atomic_router = Arc::new(ArcSwap::from_pointee(router));
+    let handle = RouteMonitor::start(
+        Arc::clone(&atomic_router),
+        exit,
+        Duration::from_millis(50),
+        || info!("multicast_root_receiver: route monitor thread started"),
+    );
+    let check: solana_turbine::LeaderRouteCheck =
+        Arc::new(move |ip| atomic_router.load().has_specific_route(ip));
+    (Some(handle), Some(check))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_leader_route_check(
+    _exit: Arc<AtomicBool>,
+) -> (Option<JoinHandle<()>>, Option<solana_turbine::LeaderRouteCheck>) {
+    (None, None)
 }
 
 fn active_vote_account_exists_in_bank(bank: &Bank, vote_account: &Pubkey) -> bool {

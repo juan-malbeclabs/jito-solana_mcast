@@ -1,7 +1,13 @@
 #![cfg(feature = "agave-unstable-api")]
 #![allow(clippy::arithmetic_side_effects)]
 
-use {smallvec::SmallVec, std::net::SocketAddr};
+use {
+    smallvec::SmallVec,
+    std::{
+        net::{IpAddr, SocketAddr},
+        sync::Arc,
+    },
+};
 
 mod addr_cache;
 
@@ -26,3 +32,8 @@ extern crate assert_matches;
 pub type ShredReceiverAddresses = SmallVec<[SocketAddr; 5]>;
 
 pub const MAX_SHRED_RECEIVER_ADDRESSES: usize = 32;
+
+/// Predicate used by the retransmit stage to decide whether a slot leader is
+/// reachable through a kernel route more specific than the default. Drives the
+/// `multicast_root_receiver` forwarding decision.
+pub type LeaderRouteCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;

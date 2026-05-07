@@ -68,7 +68,7 @@ use {
         quic::{QuicStreamerConfig, SpawnServerResult, spawn_simple_qos_server},
         streamer::StakedNodes,
     },
-    solana_turbine::{ShredReceiverAddresses, retransmit_stage::RetransmitStage},
+    solana_turbine::{LeaderRouteCheck, ShredReceiverAddresses, retransmit_stage::RetransmitStage},
     std::{
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
@@ -141,6 +141,13 @@ pub struct TvuConfig {
     pub shred_sigverify_threads: NonZeroUsize,
     pub bls_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
+    /// Multicast destination used by the retransmit stage when this validator is
+    /// turbine root and the slot leader is not reachable via a specific route.
+    pub multicast_root_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
+    /// Predicate that returns `true` when an IP is covered by a kernel route with
+    /// a non-zero prefix length. `None` disables the multicast root receiver
+    /// feature.
+    pub leader_route_check: Option<LeaderRouteCheck>,
 }
 
 impl Default for TvuConfig {
@@ -156,6 +163,8 @@ impl Default for TvuConfig {
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
+            multicast_root_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
+            leader_route_check: None,
         }
     }
 }
@@ -377,6 +386,8 @@ impl Tvu {
             votor_event_sender.clone(),
             shred_receiver_addresses,
             bam_shred_receiver_addresses,
+            tvu_config.multicast_root_receiver_address,
+            tvu_config.leader_route_check,
         );
 
         let (ancestor_duplicate_slots_sender, ancestor_duplicate_slots_receiver) = unbounded();

@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        MAX_SHRED_RECEIVER_ADDRESSES, ShredReceiverAddresses,
+        LeaderRouteCheck, MAX_SHRED_RECEIVER_ADDRESSES, ShredReceiverAddresses,
         addr_cache::AddrCache,
         cluster_nodes::{
             ClusterNodes, ClusterNodesCache, DATA_PLANE_FANOUT, Error, MAX_NUM_TURBINE_HOPS,
@@ -308,6 +308,8 @@ fn retransmit(
     migration_status: &MigrationStatus,
     shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
     bam_shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
+    multicast_root_receiver_address: &ArcSwap<Option<SocketAddr>>,
+    multicast_root_receiver_route_check: Option<&LeaderRouteCheck>,
 ) -> Result<(), ()> {
     // Try to receive shreds from the channel without blocking. If the channel
     // is empty precompute turbine trees speculatively. If no cache updates are
@@ -370,6 +372,11 @@ fn retransmit(
         .collect();
     let shred_receiver_addresses_local = shred_receiver_addresses.load();
     let bam_shred_receiver_addresses_local = bam_shred_receiver_addresses.load();
+    let multicast_root_receiver_address_local = multicast_root_receiver_address.load();
+    // Skip the per-slot route lookup when no multicast address is configured;
+    // the per-shred forward would be a no-op anyway.
+    let multicast_root_receiver_route_check = multicast_root_receiver_route_check
+        .filter(|_| multicast_root_receiver_address_local.is_some());
     let my_pubkey = cluster_info.id();
     let mut leader_schedule_epoch = None;
     let mut leader_schedule = None;
@@ -416,11 +423,31 @@ fn retransmit(
                                 .is_some_and(|leader| leader.id == my_pubkey)
                     })
                 });
+            // Multicast root receiver: when WE are turbine root for this slot
+            // AND the leader has no specific kernel route, forward shreds to the
+            // multicast group. If the leader DOES have a specific route, its own
+            // broadcast already injects the shreds, so we skip to avoid dupes.
+            // Computed once per slot here. If we cannot resolve the leader's
+            // gossip IP, conservatively skip.
+            let multicast_root_receiver_active = multicast_root_receiver_route_check
+                .zip(
+                    cluster_info
+                        .lookup_contact_info(&slot_leader.id, |node| {
+                            node.gossip().map(|sa| sa.ip())
+                        })
+                        .flatten(),
+                )
+                .is_some_and(|(check, ip)| !check(ip));
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             Some((
                 slot,
-                (slot_leader.id, cluster_nodes, include_bam_shred_receivers),
+                (
+                    slot_leader.id,
+                    cluster_nodes,
+                    include_bam_shred_receivers,
+                    multicast_root_receiver_active,
+                ),
             ))
         })
         .collect();
@@ -444,6 +471,7 @@ fn retransmit(
             stats,
             &shred_receiver_addresses_local,
             &bam_shred_receiver_addresses_local,
+            &multicast_root_receiver_address_local,
         )
     };
 
@@ -508,6 +536,7 @@ fn retransmit_shred(
             /*leader:*/ Pubkey,
             Arc<ClusterNodes<RetransmitStage>>,
             /*include_bam_shred_receivers:*/ bool,
+            /*multicast_root_receiver_active:*/ bool,
         ),
     >,
     addr_cache: &AddrCache,
@@ -517,6 +546,7 @@ fn retransmit_shred(
     stats: &RetransmitStats,
     shred_receiver_addresses: &ShredReceiverAddresses,
     bam_shred_receiver_addresses: &ShredReceiverAddresses,
+    multicast_root_receiver_address: &Option<SocketAddr>,
 ) -> Option<RetransmitShredOutput> {
     let key = shred::layout::get_shred_id(shred.as_ref())?;
     if key.slot() < root_bank.slot()
@@ -526,7 +556,7 @@ fn retransmit_shred(
         return None;
     }
     let mut compute_turbine_peers = Measure::start("turbine_start");
-    let (root_distance, addrs, include_bam_shred_receivers) =
+    let (root_distance, addrs, include_bam_shred_receivers, multicast_root_receiver_active) =
         get_retransmit_addrs(&key, cache, addr_cache, socket_addr_space, stats)?;
     compute_turbine_peers.stop();
     stats
@@ -545,13 +575,25 @@ fn retransmit_shred(
     let num_shred_receiver_addresses = shred_receiver_addresses
         .len()
         .min(MAX_SHRED_RECEIVER_ADDRESSES);
-    let external_addr_capacity =
-        num_shred_receiver_addresses.saturating_add(if include_bam_shred_receivers {
+    // Multicast root receiver: forward at the turbine root when the leader has
+    // no specific kernel route (otherwise the leader's own broadcast already
+    // injected the shred into the multicast group).
+    let push_multicast_root = root_distance == 0
+        && multicast_root_receiver_active
+        && multicast_root_receiver_address.is_some();
+    let external_addr_capacity = num_shred_receiver_addresses
+        .saturating_add(if include_bam_shred_receivers {
             bam_shred_receiver_addresses.len()
         } else {
             0
-        });
+        })
+        .saturating_add(usize::from(push_multicast_root));
     let mut external_addrs = ShredReceiverAddresses::with_capacity(external_addr_capacity);
+    if push_multicast_root
+        && let Some(mcast_addr) = multicast_root_receiver_address
+    {
+        external_addrs.push(*mcast_addr);
+    }
     for &addr in shred_receiver_addresses
         .iter()
         .take(num_shred_receiver_addresses)
@@ -645,6 +687,7 @@ fn get_retransmit_addrs<'a>(
             /*leader:*/ Pubkey,
             Arc<ClusterNodes<RetransmitStage>>,
             /*include_bam_shred_receivers:*/ bool,
+            /*multicast_root_receiver_active:*/ bool,
         ),
     >,
     addr_cache: &'a AddrCache,
@@ -654,10 +697,11 @@ fn get_retransmit_addrs<'a>(
     /*root_distance:*/ u8,
     Cow<'a, [SocketAddr]>,
     /*include_bam_shred_receivers:*/ bool,
+    /*multicast_root_receiver_active:*/ bool,
 )> {
     let cache_entry = cache.get(&shred.slot());
-    let include_bam_shred_receivers = cache_entry
-        .map(|(_, _, include_bam_shred_receivers)| *include_bam_shred_receivers)
+    let (include_bam_shred_receivers, multicast_root_receiver_active) = cache_entry
+        .map(|(_, _, bam, mrr)| (*bam, *mrr))
         .unwrap_or_default();
     if let Some((root_distance, addrs)) = addr_cache.get(shred) {
         stats.addr_cache_hit.fetch_add(1, Ordering::Relaxed);
@@ -665,9 +709,10 @@ fn get_retransmit_addrs<'a>(
             root_distance,
             Cow::Borrowed(addrs),
             include_bam_shred_receivers,
+            multicast_root_receiver_active,
         ));
     }
-    let (slot_leader, cluster_nodes, _) = cache_entry?;
+    let (slot_leader, cluster_nodes, _, _) = cache_entry?;
     let (root_distance, addrs) = cluster_nodes
         .get_retransmit_addrs(slot_leader, shred, DATA_PLANE_FANOUT, socket_addr_space)
         .inspect_err(|err| match err {
@@ -681,6 +726,7 @@ fn get_retransmit_addrs<'a>(
         root_distance,
         Cow::Owned(addrs),
         include_bam_shred_receivers,
+        multicast_root_receiver_active,
     ))
 }
 
@@ -776,6 +822,8 @@ impl RetransmitStage {
         votor_event_sender: Sender<VotorEvent>,
         shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+        multicast_root_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
+        leader_route_check: Option<LeaderRouteCheck>,
     ) -> Self {
         let migration_status = bank_forks.read().unwrap().migration_status();
         let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
@@ -799,10 +847,19 @@ impl RetransmitStage {
         let retransmit_thread_handle = Builder::new()
             .name("solRetransmittr".to_string())
             .spawn({
-                let external_sender_socket = Arc::new(
-                    bind_to_unspecified()
-                        .expect("bind retransmit external_sender_socket 0.0.0.0:0"),
-                );
+                let external_sender_socket = Arc::new({
+                    let socket = bind_to_unspecified()
+                        .expect("bind retransmit external_sender_socket 0.0.0.0:0");
+                    // Match broadcast_stage's TTL so multicast forwards can reach
+                    // beyond the local subnet.
+                    if let Err(err) = socket.set_multicast_ttl_v4(64) {
+                        warn!(
+                            "retransmit external_sender_socket: failed to set multicast \
+                             TTL: {err}"
+                        );
+                    }
+                    socket
+                });
                 move || {
                     let mut shred_buf = Vec::with_capacity(RETRANSMIT_BATCH_SIZE);
                     while retransmit(
@@ -826,6 +883,8 @@ impl RetransmitStage {
                         &migration_status,
                         &shred_receiver_addresses,
                         &bam_shred_receiver_addresses,
+                        &multicast_root_receiver_address,
+                        leader_route_check.as_ref(),
                     )
                     .is_ok()
                     {}
@@ -1159,6 +1218,7 @@ mod tests {
                     Pubkey::new_unique(),
                     cluster_nodes.clone(),
                     include_bam_shred_receivers,
+                    /*multicast_root_receiver_active:*/ false,
                 ),
             );
             let mut addr_cache = AddrCache::with_capacity(1);
@@ -1180,6 +1240,7 @@ mod tests {
                 &RetransmitStats::new(Instant::now()),
                 &shred_receiver_addresses,
                 &bam_shred_receiver_addresses,
+                &None,
             )
             .unwrap()
         };
@@ -1204,6 +1265,105 @@ mod tests {
         assert_no_packet(&duplicate_configured_receiver);
         assert_no_packet(&configured_receiver);
         assert_no_packet(&bam_receiver);
+    }
+
+    #[test]
+    fn test_retransmit_multicast_root_receiver() {
+        let bind_receiver = || {
+            let socket = bind_to_localhost_unique().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            socket
+        };
+        let recv_one = |socket: &UdpSocket| {
+            let mut buf = [0u8; 2048];
+            socket.recv_from(&mut buf).is_ok()
+        };
+
+        let turbine_receiver = bind_receiver();
+        let multicast_receiver = bind_receiver();
+        let turbine_addr = turbine_receiver.local_addr().unwrap();
+        let multicast_addr = multicast_receiver.local_addr().unwrap();
+        let retransmit_socket = bind_to_localhost_unique().unwrap();
+        let external_sender_socket = bind_to_localhost_unique().unwrap();
+
+        let keypair = get_keypair();
+        let entries = create_ticks(1, 1, Hash::new_unique());
+        let shredder = Shredder::new(5, 4, 1, 0).unwrap();
+        let (data_shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
+            &keypair,
+            &entries,
+            true,
+            Hash::new_from_array(rand::rng().random()),
+            0,
+            0,
+            &ReedSolomonCache::default(),
+            &mut ProcessShredsStats::default(),
+        );
+        let shred = data_shreds[0].payload().clone();
+        let key = shred::layout::get_shred_id(shred.as_ref()).unwrap();
+
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let root_bank = Bank::new_for_tests(&genesis_config);
+        let cluster_info = ClusterInfo::new(
+            Node::new_localhost_with_pubkey(&keypair.pubkey()).info,
+            Arc::new(keypair),
+            SocketAddrSpace::Unspecified,
+        );
+        let cluster_nodes = Arc::new(crate::cluster_nodes::new_cluster_nodes::<RetransmitStage>(
+            &cluster_info,
+            ClusterType::Development,
+            &HashMap::new(),
+            false,
+        ));
+        let empty_external = ShredReceiverAddresses::new();
+
+        // Run retransmit_shred with explicit feature inputs and report whether the
+        // multicast receiver socket saw a packet.
+        let run = |root_distance: u8, multicast_root_receiver_active: bool, multicast: Option<SocketAddr>| {
+            let mut cache = HashMap::new();
+            cache.insert(
+                key.slot(),
+                (
+                    Pubkey::new_unique(),
+                    cluster_nodes.clone(),
+                    /*include_bam_shred_receivers:*/ false,
+                    multicast_root_receiver_active,
+                ),
+            );
+            let mut addr_cache = AddrCache::with_capacity(1);
+            addr_cache.put(&key, (root_distance, Box::new([turbine_addr])));
+            let mut rng = ChaChaRng::from_seed([0xa5; 32]);
+            let shred_deduper = ShredDeduper::<2>::new(&mut rng, /*num_bits:*/ 640_007);
+            retransmit_shred(
+                shred.clone(),
+                &root_bank,
+                &shred_deduper,
+                &cache,
+                &addr_cache,
+                &SocketAddrSpace::Unspecified,
+                RetransmitSocket::Socket(&retransmit_socket),
+                &external_sender_socket,
+                &RetransmitStats::new(Instant::now()),
+                &empty_external,
+                &empty_external,
+                &multicast,
+            )
+            .unwrap();
+            // Drain the turbine receiver so subsequent runs start clean.
+            let _ = recv_one(&turbine_receiver);
+            recv_one(&multicast_receiver)
+        };
+
+        // Turbine root + leader off-DZ + multicast configured → multicast forwards.
+        assert!(run(0, true, Some(multicast_addr)));
+        // Turbine root + leader on-DZ → no forward (avoid duplicating leader broadcast).
+        assert!(!run(0, false, Some(multicast_addr)));
+        // Not turbine root → no forward even with everything else on.
+        assert!(!run(1, true, Some(multicast_addr)));
+        // Multicast address unset → no forward.
+        assert!(!run(0, true, None));
     }
 
     #[test]
