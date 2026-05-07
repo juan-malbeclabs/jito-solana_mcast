@@ -1,6 +1,5 @@
 use {
     arc_swap::ArcSwap,
-    solana_cluster_type::ClusterType,
     solana_metrics::datapoint_info,
     std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -20,6 +19,16 @@ pub const MULTICAST_SHRED_ADDR_MAINNET: SocketAddr =
 
 pub const MULTICAST_SHRED_ADDR_TESTNET: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(233, 84, 178, 10)), 7733);
+
+/// Multicast destinations used by the retransmit stage when this validator is
+/// the turbine root for a slot whose leader is not reachable via a specific
+/// kernel route. Tracked separately from `MULTICAST_SHRED_ADDR_*` so the
+/// leader and root retransmit paths can target different multicast groups.
+pub const MULTICAST_ROOT_SHRED_ADDR_MAINNET: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(233, 84, 178, 16)), 7733);
+
+pub const MULTICAST_ROOT_SHRED_ADDR_TESTNET: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(233, 84, 178, 12)), 7733);
 
 /// How often to run the multicast check.
 const CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -43,13 +52,9 @@ impl MulticastShredCheckService {
     pub fn new(
         exit: Arc<AtomicBool>,
         multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
-        cluster_type: ClusterType,
+        multicast_addr: SocketAddr,
     ) -> Self {
-        let multicast_addr = match cluster_type {
-            ClusterType::Testnet => MULTICAST_SHRED_ADDR_TESTNET,
-            _ => MULTICAST_SHRED_ADDR_MAINNET,
-        };
-        info!("Starting MulticastShredCheckService for {cluster_type:?} ({multicast_addr})");
+        info!("Starting MulticastShredCheckService for {multicast_addr}");
         let thread_hdl = Builder::new()
             .name("solMcastShrdChk".to_string())
             .spawn(move || {

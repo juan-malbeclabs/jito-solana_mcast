@@ -8397,6 +8397,7 @@ dependencies = [
  "agave-transaction-view",
  "agave-verified-packet-receiver",
  "agave-votor",
+ "agave-xdp",
  "ahash 0.8.11",
  "anyhow",
  "anza-quinn",

@@ -169,6 +169,31 @@ impl Router {
             if_index,
         })
     }
+
+    /// Returns true if there is a non-default route (prefix_len > 0) in the kernel
+    /// route table that matches `dest_ip`. The default route (destination unset,
+    /// or 0.0.0.0/0) is intentionally excluded.
+    pub fn has_specific_route(&self, dest_ip: IpAddr) -> bool {
+        let family = match dest_ip {
+            IpAddr::V4(_) => AF_INET as u8,
+            IpAddr::V6(_) => AF_INET6 as u8,
+        };
+
+        self.routes.iter().any(|route| {
+            if route.family != family || route.destination.is_none() || route.dst_len == 0 {
+                return false;
+            }
+            match (dest_ip, route.destination) {
+                (IpAddr::V4(addr), Some(IpAddr::V4(net))) => {
+                    is_ipv4_match(addr, net, route.dst_len)
+                }
+                (IpAddr::V6(addr), Some(IpAddr::V6(net))) => {
+                    is_ipv6_match(addr, net, route.dst_len)
+                }
+                _ => false,
+            }
+        })
+    }
 }
 
 struct ArpTable {
@@ -248,5 +273,63 @@ mod tests {
         let router = Router::new().unwrap();
         let next_hop = router.route("1.1.1.1".parse().unwrap()).unwrap();
         eprintln!("{next_hop:?}");
+    }
+
+    #[test]
+    fn test_has_specific_route() {
+        let mut router = Router::new().unwrap();
+
+        // Pick a unique private /32 unlikely to have an existing specific route.
+        let target = Ipv4Addr::new(10, 255, 254, 99);
+        let target_ip = IpAddr::V4(target);
+
+        // No specific route yet — only the default (if any) might match.
+        assert!(!router.has_specific_route(target_ip));
+
+        // Insert a /24 that covers the target.
+        let route = RouteEntry {
+            destination: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 254, 0))),
+            gateway: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 254, 1))),
+            pref_src: None,
+            out_if_index: Some(1),
+            in_if_index: None,
+            priority: None,
+            table: None,
+            protocol: 0,
+            scope: 0,
+            type_: 0,
+            family: AF_INET as u8,
+            dst_len: 24,
+        };
+        router.routes.push(route);
+        assert!(router.has_specific_route(target_ip));
+
+        // Remove and confirm the match disappears.
+        router.routes.pop();
+        assert!(!router.has_specific_route(target_ip));
+    }
+
+    #[test]
+    fn test_has_specific_route_excludes_default() {
+        // Build a router with only a default route and confirm has_specific_route
+        // returns no match. (Direct test of the filter logic — does not depend on
+        // kernel state.)
+        let mut router = Router::new().unwrap();
+        router.routes.clear();
+        router.routes.push(RouteEntry {
+            destination: None,
+            gateway: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))),
+            pref_src: None,
+            out_if_index: Some(1),
+            in_if_index: None,
+            priority: None,
+            table: None,
+            protocol: 0,
+            scope: 0,
+            type_: 0,
+            family: AF_INET as u8,
+            dst_len: 0,
+        });
+        assert!(!router.has_specific_route(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 }
