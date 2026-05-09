@@ -102,6 +102,10 @@ pub struct TvuConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
+    /// Multicast destination used by the retransmit stage when this validator is
+    /// turbine root. Updated by a `MulticastShredCheckService`, read by the
+    /// retransmit stage.
+    pub multicast_root_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
 }
 
 impl Default for TvuConfig {
@@ -116,6 +120,7 @@ impl Default for TvuConfig {
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
+            multicast_root_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
 }
@@ -237,6 +242,7 @@ impl Tvu {
             None,
             shred_receiver_addresses,
             bam_shred_receiver_addresses,
+            tvu_config.multicast_root_receiver_address,
         );
 
         let (ancestor_duplicate_slots_sender, ancestor_duplicate_slots_receiver) = unbounded();
