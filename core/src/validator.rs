@@ -18,7 +18,11 @@ use {
             tower_storage::{NullTowerStorage, TowerStorage},
         },
         forwarding_stage::ForwardingClientConfig,
-        multicast_shred_check_service::MulticastShredCheckService,
+        multicast_shred_check_service::{
+            MulticastShredCheckService, MULTICAST_ROOT_SHRED_ADDR_MAINNET,
+            MULTICAST_ROOT_SHRED_ADDR_TESTNET, MULTICAST_SHRED_ADDR_MAINNET,
+            MULTICAST_SHRED_ADDR_TESTNET,
+        },
         proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         repair::{
             self,
@@ -670,9 +674,11 @@ pub struct Validator {
     transaction_status_service: Option<TransactionStatusService>,
     entry_notifier_service: Option<EntryNotifierService>,
     system_monitor_service: Option<SystemMonitorService>,
-    /// Background watcher that keeps the cluster multicast shred address in sync
-    /// with kernel route availability.
-    multicast_shred_check_service: Option<MulticastShredCheckService>,
+    /// Background watchers that keep the cluster multicast shred addresses in
+    /// sync with kernel route availability. One per multicast destination
+    /// (leader broadcast and retransmit root forwarding). Empty on cluster
+    /// types that do not advertise a multicast group.
+    multicast_shred_check_services: Vec<MulticastShredCheckService>,
     sample_performance_service: Option<SamplePerformanceService>,
     stats_reporter_service: StatsReporterService,
     gossip_service: GossipService,
@@ -1635,6 +1641,12 @@ impl Validator {
                 (None, None)
             };
 
+        // Multicast destination used by the retransmit stage when this validator is
+        // turbine root. Updated by a `MulticastShredCheckService`, read by the
+        // retransmit stage. Internal to validator setup — no external consumer.
+        let multicast_root_receiver_address: Arc<ArcSwap<Option<SocketAddr>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+
         // disable all2all tests if not allowed for a given cluster type
         let alpenglow_socket = if genesis_config.cluster_type == ClusterType::Testnet
             || genesis_config.cluster_type == ClusterType::Development
@@ -1690,6 +1702,7 @@ impl Validator {
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
+                multicast_root_receiver_address: multicast_root_receiver_address.clone(),
             },
             &max_slots,
             block_metadata_notifier,
@@ -1840,18 +1853,40 @@ impl Validator {
             shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
         });
 
-        let multicast_shred_check_service = (!config.disable_multicast_shred_check
+        let multicast_shred_check_services = if !config.disable_multicast_shred_check
             && matches!(
                 genesis_config.cluster_type,
                 ClusterType::MainnetBeta | ClusterType::Testnet
-            ))
-        .then(|| {
-            MulticastShredCheckService::new(
-                exit.clone(),
-                config.multicast_receiver_address.clone(),
-                genesis_config.cluster_type,
-            )
-        });
+            ) {
+            let (leader_addr, root_addr) = match genesis_config.cluster_type {
+                ClusterType::Testnet => {
+                    (MULTICAST_SHRED_ADDR_TESTNET, MULTICAST_ROOT_SHRED_ADDR_TESTNET)
+                }
+                _ => (
+                    MULTICAST_SHRED_ADDR_MAINNET,
+                    MULTICAST_ROOT_SHRED_ADDR_MAINNET,
+                ),
+            };
+            vec![
+                MulticastShredCheckService::new(
+                    exit.clone(),
+                    config.multicast_receiver_address.clone(),
+                    leader_addr,
+                    "solMcastShrdChkL",
+                ),
+                MulticastShredCheckService::new(
+                    exit.clone(),
+                    multicast_root_receiver_address.clone(),
+                    root_addr,
+                    "solMcastShrdChkR",
+                ),
+            ]
+        } else {
+            // Development and Devnet do not advertise a multicast group;
+            // multicast_root_receiver_address remains None for the lifetime
+            // of the validator, so retransmit forwarding is silently a no-op.
+            Vec::new()
+        };
 
         Ok(Self {
             logfile: config.logfile.clone(),
@@ -1866,7 +1901,7 @@ impl Validator {
             transaction_status_service,
             entry_notifier_service,
             system_monitor_service,
-            multicast_shred_check_service,
+            multicast_shred_check_services,
             sample_performance_service,
             snapshot_packager_service,
             completed_data_sets_service,
@@ -2020,7 +2055,7 @@ impl Validator {
                 .expect("system_monitor_service");
         }
 
-        if let Some(multicast_shred_check_service) = self.multicast_shred_check_service {
+        for multicast_shred_check_service in self.multicast_shred_check_services {
             multicast_shred_check_service
                 .join()
                 .expect("multicast_shred_check_service");
