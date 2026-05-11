@@ -9,6 +9,8 @@ pub mod broadcast_stage;
 
 pub mod cluster_nodes;
 
+pub mod multicast_root_forwarder;
+
 pub mod retransmit_stage;
 
 pub mod sigverify_shreds;
@@ -22,6 +24,8 @@ extern crate solana_metrics;
 #[cfg(test)]
 #[macro_use]
 extern crate assert_matches;
+
+pub use multicast_root_forwarder::MulticastRootConfig;
 
 pub type ShredReceiverAddresses = SmallVec<[SocketAddr; 5]>;
 
