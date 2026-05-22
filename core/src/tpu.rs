@@ -81,7 +81,7 @@ use {
         path::PathBuf,
         sync::{
             Arc, Mutex, RwLock,
-            atomic::{AtomicBool, AtomicU8},
+            atomic::{AtomicBool, AtomicU8, AtomicU32},
         },
         thread::{self, JoinHandle},
     },
@@ -182,6 +182,7 @@ impl Tpu {
         bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
         bam_url: Arc<ArcSwap<Option<String>>>,
+        leader_shred_drop_every: Arc<AtomicU32>,
     ) -> Self {
         let TpuSockets {
             vote: tpu_vote_sockets,
@@ -529,6 +530,7 @@ impl Tpu {
             shred_receiver_addresses,
             bam_shred_receiver_addresses,
             multicast_receiver_address,
+            leader_shred_drop_every,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

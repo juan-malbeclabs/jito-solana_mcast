@@ -60,7 +60,7 @@ use {
         path::PathBuf,
         sync::{
             Arc, RwLock,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU32, Ordering},
         },
         thread::{self, JoinHandle, sleep},
         time::{Duration, Instant, SystemTime},
@@ -858,6 +858,7 @@ impl BankingSimulator {
             Arc::new(ArcSwap::default()),
             Arc::new(ArcSwap::default()),
             Arc::new(ArcSwap::default()),
+            Arc::new(AtomicU32::new(0)),
         );
 
         info!("Start banking stage!...");

@@ -6,6 +6,7 @@ use {
     solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
     std::{
         net::{SocketAddr, UdpSocket},
+        sync::atomic::{AtomicU32, AtomicU64},
         thread::sleep,
         time::Duration,
     },
@@ -189,6 +190,9 @@ impl BroadcastRun for FailEntryVerificationBroadcastRun {
         bam_shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
         multicast_receiver_address: &ArcSwap<Option<SocketAddr>>,
         shred_receiver_socket: &UdpSocket,
+        _leader_shred_drop_every: &AtomicU32,
+        leader_shred_counter: &AtomicU64,
+        leader_shred_drop_seed: u64,
     ) -> Result<()> {
         let (shreds, _) = receiver.recv()?;
         broadcast_shreds(
@@ -205,6 +209,9 @@ impl BroadcastRun for FailEntryVerificationBroadcastRun {
             &shred_receiver_addresses.load(),
             &bam_shred_receiver_addresses.load(),
             &multicast_receiver_address.load(),
+            0, // drop disabled in this run mode
+            leader_shred_counter,
+            leader_shred_drop_seed,
         )
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {

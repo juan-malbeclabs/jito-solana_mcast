@@ -37,7 +37,7 @@ use {
         net::{SocketAddr, UdpSocket},
         sync::{
             Arc, Mutex, RwLock,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -131,6 +131,7 @@ impl BroadcastStageType {
         shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
+        leader_shred_drop_every: Arc<AtomicU32>,
     ) -> BroadcastStage {
         let migration_status = bank_forks.read().unwrap().migration_status();
         match self {
@@ -148,6 +149,7 @@ impl BroadcastStageType {
                 shred_receiver_addresses,
                 bam_shred_receiver_addresses,
                 multicast_receiver_address,
+                leader_shred_drop_every,
             ),
 
             BroadcastStageType::FailEntryVerification => BroadcastStage::new(
@@ -164,6 +166,7 @@ impl BroadcastStageType {
                 Arc::new(ArcSwap::from_pointee(ShredReceiverAddresses::new())),
                 Arc::default(),
                 Arc::new(ArcSwap::from_pointee(None)),
+                Arc::new(AtomicU32::new(0)),
             ),
 
             BroadcastStageType::BroadcastFakeShreds => BroadcastStage::new(
@@ -180,6 +183,7 @@ impl BroadcastStageType {
                 Arc::new(ArcSwap::from_pointee(ShredReceiverAddresses::new())),
                 Arc::default(),
                 Arc::new(ArcSwap::from_pointee(None)),
+                Arc::new(AtomicU32::new(0)),
             ),
 
             BroadcastStageType::BroadcastDuplicates(config) => BroadcastStage::new(
@@ -201,6 +205,7 @@ impl BroadcastStageType {
                 Arc::new(ArcSwap::from_pointee(ShredReceiverAddresses::new())),
                 Arc::default(),
                 Arc::new(ArcSwap::from_pointee(None)),
+                Arc::new(AtomicU32::new(0)),
             ),
         }
     }
@@ -231,6 +236,9 @@ trait BroadcastRun {
         // socket so the OS routing table (not --bind-address) selects the outbound interface
         // per destination. The XDP path resolves routes from the kernel table directly.
         shred_receiver_socket: &UdpSocket,
+        leader_shred_drop_every: &AtomicU32,
+        leader_shred_counter: &AtomicU64,
+        leader_shred_drop_seed: u64,
     ) -> Result<()>;
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()>;
 }
@@ -331,7 +339,16 @@ impl BroadcastStage {
         shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
         multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
+        leader_shred_drop_every: Arc<AtomicU32>,
     ) -> Self {
+        // Counter of leader shreds processed while drop is active; shared by all transmit
+        // threads to keep the global cadence "1 per window of N".
+        let leader_shred_counter = Arc::new(AtomicU64::new(0));
+        // Process-local random seed for the splitmix64-derived drop position within each
+        // window. Re-randomized on every validator restart so that the per-window position
+        // is not predictable from outside.
+        let leader_shred_drop_seed: u64 = rand::random();
+
         let (socket_sender, socket_receiver) = unbounded();
         let (blockstore_sender, blockstore_receiver) = unbounded();
         let bs_run = broadcast_stage_run.clone();
@@ -405,6 +422,9 @@ impl BroadcastStage {
             let bam_shred_receiver_addresses = bam_shred_receiver_addresses.clone();
             let multicast_receiver_address = multicast_receiver_address.clone();
             let shred_receiver_socket = shred_receiver_socket.clone();
+            let leader_shred_drop_every = leader_shred_drop_every.clone();
+            let leader_shred_counter = leader_shred_counter.clone();
+            let leader_shred_drop_seed = leader_shred_drop_seed;
 
             let run_transmit = move || loop {
                 let sock_variant = match xdp_sender.as_ref() {
@@ -425,6 +445,9 @@ impl BroadcastStage {
                     &bam_shred_receiver_addresses,
                     &multicast_receiver_address,
                     &shred_receiver_socket,
+                    &leader_shred_drop_every,
+                    &leader_shred_counter,
+                    leader_shred_drop_seed,
                 );
                 if let Some(res) = Self::handle_error(res, "solana-broadcaster-transmit") {
                     return res;
@@ -543,6 +566,15 @@ pub enum BroadcastSocket<'a> {
     Xdp(&'a XdpSender),
 }
 
+// SplitMix64 finalizer. Used to derive an unpredictable-but-deterministic drop
+// position within each window of N leader shreds: drop_pos(w) = splitmix64(w ^ seed) % N.
+// Avoids per-window RNG state and synchronization between transmit threads.
+pub(crate) fn splitmix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
 /// Broadcasts shreds from the leader (i.e. this node) to the root of the
 /// turbine retransmit tree for each shred.
 #[allow(clippy::too_many_arguments)]
@@ -560,6 +592,9 @@ pub fn broadcast_shreds(
     shred_receiver_addresses: &ShredReceiverAddresses,
     bam_shred_receiver_addresses: &ShredReceiverAddresses,
     multicast_receiver_address: &Option<SocketAddr>,
+    leader_shred_drop_every: u32,
+    leader_shred_counter: &AtomicU64,
+    leader_shred_drop_seed: u64,
 ) -> Result<()> {
     let mut result = Ok(());
     // Compute destinations for each of the shreds to be sent
@@ -599,12 +634,35 @@ pub fn broadcast_shreds(
     }
     let packet_capacity = shreds.len().saturating_mul(1 + external_addrs.len());
     let mut all_packets = Vec::with_capacity(packet_capacity);
+    // Drop "1 per window of N" only if N>=2 AND DZ multicast is active — otherwise the
+    // shred would actually be lost, instead of just being routed exclusively through DZ.
+    let drop_active = leader_shred_drop_every >= 2 && multicast_receiver_address.is_some();
+    let drop_n = leader_shred_drop_every as u64;
     for (slot, shreds) in shreds.iter().chunk_by(|shred| shred.slot()).into_iter() {
         let cluster_nodes = cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
         update_peer_stats(&cluster_nodes, last_datapoint_submit);
 
         for shred in shreds {
             let key = shred.id();
+            if drop_active {
+                let pos = leader_shred_counter.fetch_add(1, Ordering::Relaxed);
+                let window_idx = pos / drop_n;
+                let pos_in_window = pos % drop_n;
+                let drop_pos = splitmix64(window_idx ^ leader_shred_drop_seed) % drop_n;
+                if pos_in_window == drop_pos {
+                    log::info!(
+                        "leader_shred_dropped_from_turbine slot={} index={} type={:?} \
+                         drop_every={} window={} pos_in_window={}",
+                        key.slot(),
+                        key.index(),
+                        key.shred_type(),
+                        leader_shred_drop_every,
+                        window_idx,
+                        pos_in_window,
+                    );
+                    continue;
+                }
+            }
             if let Some(addr) = cluster_nodes
                 .get_broadcast_peer(&key)
                 .and_then(|peer| peer.tvu(Protocol::UDP))
@@ -782,6 +840,54 @@ pub mod test {
     }
 
     #[test]
+    fn test_drop_window_cadence_and_uniqueness() {
+        // For every value of N from 2 to 16, walk a 200-window stream and verify:
+        //   - exactly one drop per window
+        //   - drop positions are not all the same (the seed actually scrambles)
+        let seed: u64 = 0xdead_beef_cafe_f00d;
+        for drop_every in 2u32..=16 {
+            let counter = AtomicU64::new(0);
+            let drop_n = drop_every as u64;
+            let windows = 200u64;
+            let total = drop_n * windows;
+            let mut per_window_drops = std::collections::HashMap::<u64, u64>::new();
+            let mut positions_seen = std::collections::HashSet::<u64>::new();
+            for _ in 0..total {
+                let pos = counter.fetch_add(1, Ordering::Relaxed);
+                let window_idx = pos / drop_n;
+                let pos_in_window = pos % drop_n;
+                let drop_pos = splitmix64(window_idx ^ seed) % drop_n;
+                if pos_in_window == drop_pos {
+                    *per_window_drops.entry(window_idx).or_insert(0) += 1;
+                    positions_seen.insert(drop_pos);
+                }
+            }
+            assert_eq!(
+                per_window_drops.len() as u64,
+                windows,
+                "every window should have a drop (N={drop_every})"
+            );
+            for (w, c) in &per_window_drops {
+                assert_eq!(*c, 1, "exactly one drop per window (N={drop_every}, w={w})");
+            }
+            if drop_every >= 4 {
+                assert!(
+                    positions_seen.len() >= 2,
+                    "positions should vary across windows (N={drop_every}, seen={positions_seen:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_splitmix64_changes_with_input() {
+        // Spot-check that the scrambler isn't degenerate.
+        assert_ne!(splitmix64(0), splitmix64(1));
+        assert_ne!(splitmix64(1), splitmix64(2));
+        assert_ne!(splitmix64(0xdead), splitmix64(0xbeef));
+    }
+
+    #[test]
     fn test_external_shred_receivers_are_deduped_and_configured_cap_only() {
         let bind_receiver = || {
             let socket = bind_to_localhost_unique().unwrap();
@@ -845,6 +951,9 @@ pub mod test {
             &configured_addrs,
             &bam_addrs,
             &Some(multicast_addr),
+            0,
+            &AtomicU64::new(0),
+            0,
         )
         .unwrap();
 
@@ -970,6 +1079,7 @@ pub mod test {
             Arc::default(),
             Arc::default(),
             Arc::default(),
+            Arc::new(AtomicU32::new(0)),
         );
 
         MockBroadcastStage {

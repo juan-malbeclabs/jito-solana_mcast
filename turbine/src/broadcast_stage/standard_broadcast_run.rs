@@ -16,7 +16,14 @@ use {
         Shred, ShredType, Shredder,
     },
     solana_time_utils::AtomicInterval,
-    std::{borrow::Cow, net::SocketAddr, sync::RwLock},
+    std::{
+        borrow::Cow,
+        net::SocketAddr,
+        sync::{
+            RwLock,
+            atomic::{AtomicU32, AtomicU64},
+        },
+    },
 };
 
 #[derive(Clone)]
@@ -192,6 +199,9 @@ impl StandardBroadcastRun {
             &ArcSwap::default(),
             &ArcSwap::default(),
             &shred_receiver_socket,
+            &AtomicU32::new(0),
+            &AtomicU64::new(0),
+            0,
         );
         let _ = self.record(&brecv, blockstore);
         Ok(())
@@ -407,6 +417,9 @@ impl StandardBroadcastRun {
         shred_receiver_addresses: &ShredReceiverAddresses,
         bam_shred_receiver_addresses: &ShredReceiverAddresses,
         multicast_receiver_address: &Option<SocketAddr>,
+        leader_shred_drop_every: u32,
+        leader_shred_counter: &AtomicU64,
+        leader_shred_drop_seed: u64,
     ) -> Result<()> {
         trace!("Broadcasting {:?} shreds", shreds.len());
         let mut transmit_stats = TransmitShredsStats {
@@ -432,6 +445,9 @@ impl StandardBroadcastRun {
             shred_receiver_addresses,
             bam_shred_receiver_addresses,
             multicast_receiver_address,
+            leader_shred_drop_every,
+            leader_shred_counter,
+            leader_shred_drop_seed,
         )?;
         transmit_time.stop();
 
@@ -503,8 +519,15 @@ impl BroadcastRun for StandardBroadcastRun {
         bam_shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
         multicast_receiver_address: &ArcSwap<Option<SocketAddr>>,
         shred_receiver_socket: &UdpSocket,
+        leader_shred_drop_every: &AtomicU32,
+        leader_shred_counter: &AtomicU64,
+        leader_shred_drop_seed: u64,
     ) -> Result<()> {
         let (shreds, batch_info) = receiver.recv()?;
+        // Snapshot drop_every once per batch so shreds in the same batch don't see different
+        // values if admin RPC writes the atomic mid-batch.
+        let drop_every =
+            leader_shred_drop_every.load(std::sync::atomic::Ordering::Relaxed);
         self.broadcast(
             sock,
             shred_receiver_socket,
@@ -516,6 +539,9 @@ impl BroadcastRun for StandardBroadcastRun {
             &shred_receiver_addresses.load(),
             &bam_shred_receiver_addresses.load(),
             &multicast_receiver_address.load(),
+            drop_every,
+            leader_shred_counter,
+            leader_shred_drop_seed,
         )
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {

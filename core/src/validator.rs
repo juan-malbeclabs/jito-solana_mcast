@@ -163,7 +163,7 @@ use {
         str::FromStr,
         sync::{
             Arc, Mutex, RwLock,
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -407,6 +407,9 @@ pub struct ValidatorConfig {
     pub bam_url: Arc<ArcSwap<Option<String>>>,
     /// Skips automatic multicast route detection and multicast receiver updates.
     pub disable_multicast_shred_check: bool,
+    /// EXPERIMENTAL: drop 1 out of every N of this validator's own broadcast shreds
+    /// from the Turbine path while DZ multicast is active. 0 or 1 disables.
+    pub leader_shred_drop_every: Arc<AtomicU32>,
 }
 
 impl ValidatorConfig {
@@ -500,6 +503,7 @@ impl ValidatorConfig {
             tip_manager_config: TipManagerConfig::default(),
             bam_url: Arc::new(ArcSwap::from_pointee(None)),
             disable_multicast_shred_check: false,
+            leader_shred_drop_every: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -1797,6 +1801,7 @@ impl Validator {
             bam_shred_receiver_addresses,
             config.multicast_receiver_address.clone(),
             config.bam_url.clone(),
+            config.leader_shred_drop_every.clone(),
         );
 
         datapoint_info!(
@@ -1833,6 +1838,7 @@ impl Validator {
             relayer_config: config.relayer_config.clone(),
             shred_receiver_addresses: config.shred_receiver_addresses.clone(),
             shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
+            leader_shred_drop_every: config.leader_shred_drop_every.clone(),
         });
 
         let multicast_shred_check_service = (!config.disable_multicast_shred_check

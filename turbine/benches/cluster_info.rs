@@ -22,7 +22,11 @@ use {
         },
         cluster_nodes::ClusterNodesCache,
     },
-    std::{collections::HashMap, sync::Arc, time::Duration},
+    std::{
+        collections::HashMap,
+        sync::{Arc, atomic::AtomicU64},
+        time::Duration,
+    },
 };
 
 fn broadcast_shreds_bench(b: &mut Bencher) {
@@ -97,6 +101,9 @@ fn broadcast_shreds_bench(b: &mut Bencher) {
             &shred_receiver_addresses,
             &shred_receiver_addresses,
             &None,
+            0,
+            &AtomicU64::new(0),
+            0,
         )
         .unwrap();
     });

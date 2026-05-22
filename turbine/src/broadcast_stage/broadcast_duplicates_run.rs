@@ -12,7 +12,11 @@ use {
     solana_signature::Signature,
     solana_signer::Signer,
     solana_system_transaction as system_transaction,
-    std::{collections::HashSet, net::SocketAddr},
+    std::{
+        collections::HashSet,
+        net::SocketAddr,
+        sync::atomic::{AtomicU32, AtomicU64},
+    },
 };
 
 pub const MINIMUM_DUPLICATE_SLOT: Slot = 20;
@@ -340,6 +344,9 @@ impl BroadcastRun for BroadcastDuplicatesRun {
         _bam_shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
         _multicast_receiver_address: &ArcSwap<Option<SocketAddr>>,
         _shred_receiver_socket: &UdpSocket,
+        _leader_shred_drop_every: &AtomicU32,
+        _leader_shred_counter: &AtomicU64,
+        _leader_shred_drop_seed: u64,
     ) -> Result<()> {
         let (shreds, _) = receiver.recv()?;
         if shreds.is_empty() {

@@ -1337,6 +1337,21 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("experimental_leader_shred_drop_every")
+            .hidden(hidden_unless_forced())
+            .long("experimental-leader-shred-drop-every")
+            .takes_value(true)
+            .value_name("N")
+            .default_value("0")
+            .validator(|s| s.parse::<u32>().map(|_| ()).map_err(|e| e.to_string()))
+            .help(
+                "EXPERIMENTAL: When this validator is leader and connected to DoubleZero, \
+                 drop 1 out of every N of its own broadcast shreds from the Turbine path. \
+                 The shred still goes out via the DoubleZero multicast group. 0 or 1 \
+                 disables the feature. Has no effect if DoubleZero is not active.",
+            ),
+    )
+    .arg(
         Arg::with_name("retransmit_xdp_interface")
             .hidden(hidden_unless_forced())
             .long("experimental-retransmit-xdp-interface")

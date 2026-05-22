@@ -14,7 +14,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         net::UdpSocket,
-        sync::{Arc, RwLock},
+        sync::{Arc, RwLock, atomic::AtomicU32},
     },
     tokio::sync::mpsc,
 };
@@ -96,4 +96,5 @@ pub struct AdminRpcRequestMetadataPostInit {
     pub relayer_config: Arc<ArcSwap<RelayerConfig>>,
     pub shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
     pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+    pub leader_shred_drop_every: Arc<AtomicU32>,
 }

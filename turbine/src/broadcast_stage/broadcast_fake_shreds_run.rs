@@ -6,7 +6,10 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::shred::{self, ProcessShredsStats, ReedSolomonCache, Shredder},
-    std::net::SocketAddr,
+    std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicU32, AtomicU64},
+    },
 };
 
 #[derive(Clone)]
@@ -162,6 +165,9 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         _bam_shred_receiver_addresses: &ArcSwap<ShredReceiverAddresses>,
         _multicast_receiver_address: &ArcSwap<Option<SocketAddr>>,
         _shred_receiver_socket: &UdpSocket,
+        _leader_shred_drop_every: &AtomicU32,
+        _leader_shred_counter: &AtomicU64,
+        _leader_shred_drop_seed: u64,
     ) -> Result<()> {
         let sock = match sock {
             BroadcastSocket::Udp(sock) => sock,

@@ -324,6 +324,9 @@ pub trait AdminRpc {
         meta: Self::Metadata,
         addr: String,
     ) -> Result<()>;
+
+    #[rpc(meta, name = "setLeaderShredDropEvery")]
+    fn set_leader_shred_drop_every(&self, meta: Self::Metadata, n: u32) -> Result<()>;
 }
 
 pub struct AdminRpcImpl;
@@ -739,6 +742,16 @@ impl AdminRpc for AdminRpcImpl {
             post_init
                 .shred_retransmit_receiver_addresses
                 .store(Arc::new(shred_receiver_addresses));
+            Ok(())
+        })
+    }
+
+    fn set_leader_shred_drop_every(&self, meta: Self::Metadata, n: u32) -> Result<()> {
+        meta.with_post_init(|post_init| {
+            post_init
+                .leader_shred_drop_every
+                .store(n, Ordering::Relaxed);
+            info!("leader_shred_drop_every set to {n}");
             Ok(())
         })
     }
@@ -1210,7 +1223,11 @@ mod tests {
             bank_forks::BankForks,
         },
         solana_turbine::ShredReceiverAddresses,
-        std::{collections::HashSet, fs::remove_dir_all, sync::atomic::AtomicBool},
+        std::{
+            collections::HashSet,
+            fs::remove_dir_all,
+            sync::atomic::{AtomicBool, AtomicU32},
+        },
         tokio::sync::mpsc,
     };
 
@@ -1292,6 +1309,7 @@ mod tests {
                     relayer_config,
                     shred_receiver_addresses,
                     shred_retransmit_receiver_addresses,
+                    leader_shred_drop_every: Arc::new(AtomicU32::new(0)),
                 }))),
                 staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
                 rpc_to_plugin_manager_sender: None,

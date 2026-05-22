@@ -85,7 +85,10 @@ use {
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::{self, FromStr},
-        sync::{Arc, RwLock, atomic::AtomicBool},
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicBool, AtomicU32},
+        },
         time::Duration,
     },
 };
@@ -950,6 +953,11 @@ pub fn execute(
         tip_manager_config,
         bam_url,
         disable_multicast_shred_check: matches.is_present("disable_multicast_shred_check"),
+        leader_shred_drop_every: Arc::new(AtomicU32::new(value_t_or_exit!(
+            matches,
+            "experimental_leader_shred_drop_every",
+            u32
+        ))),
     };
 
     let vote_account = pubkey_of(matches, "vote_account").unwrap_or_else(|| {
