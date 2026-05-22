@@ -644,7 +644,11 @@ pub fn broadcast_shreds(
 
         for shred in shreds {
             let key = shred.id();
-            if drop_active {
+            // Sample only data shreds. Coding shreds are erasure parity that other nodes
+            // can use to reconstruct missing data; dropping them wouldn't prove anything
+            // about who re-emitted the shred outside DZ. The counter only advances for
+            // data shreds so the "1 per window of N" cadence is measured in data shreds.
+            if drop_active && shred.is_data() {
                 let pos = leader_shred_counter.fetch_add(1, Ordering::Relaxed);
                 let window_idx = pos / drop_n;
                 let pos_in_window = pos % drop_n;
@@ -885,6 +889,88 @@ pub mod test {
         assert_ne!(splitmix64(0), splitmix64(1));
         assert_ne!(splitmix64(1), splitmix64(2));
         assert_ne!(splitmix64(0xdead), splitmix64(0xbeef));
+    }
+
+    // Verifies that only data shreds participate in the drop sampling:
+    //   - the global counter must not advance on coding shreds (so the per-window
+    //     cadence is measured in data shreds, not in arbitrary shred types);
+    //   - a coding shred at what would otherwise be a drop position is left alone.
+    // We can't assert main-socket delivery in this minimal setup (no real turbine
+    // peers), so the counter is the load-bearing assertion.
+    #[test]
+    fn test_only_data_shreds_are_dropped() {
+        let main_sender = bind_to_localhost_unique().unwrap();
+        let external_sender = bind_to_localhost_unique().unwrap();
+        let multicast_receiver = bind_to_localhost_unique().unwrap();
+        multicast_receiver
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let multicast_addr = multicast_receiver.local_addr().unwrap();
+
+        let keypair = Arc::new(Keypair::new());
+        let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
+        let cluster_info =
+            ClusterInfo::new(node.info.clone(), keypair, SocketAddrSpace::Unspecified);
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let cluster_nodes_cache =
+            ClusterNodesCache::<BroadcastStage>::new(1, Duration::from_secs(60));
+        let empty_addrs = ShredReceiverAddresses::new();
+
+        let (data_shreds, coding_shreds, _, _) = make_transmit_shreds(0, 1);
+        assert!(data_shreds[0].is_data());
+        assert!(!coding_shreds[0].is_data());
+
+        let invoke = |shred: &Shred, counter: &AtomicU64| {
+            broadcast_shreds(
+                BroadcastSocket::Udp(&main_sender),
+                &external_sender,
+                std::slice::from_ref(shred),
+                &cluster_nodes_cache,
+                &AtomicInterval::default(),
+                &mut TransmitShredsStats::default(),
+                &cluster_info,
+                &bank_forks,
+                &SocketAddrSpace::Unspecified,
+                &None,
+                &empty_addrs,
+                &empty_addrs,
+                &Some(multicast_addr),
+                /* drop_every: */ 2,
+                counter,
+                /* drop_seed: */ 0,
+            )
+            .unwrap();
+        };
+
+        // Coding shred: counter must NOT advance — coding shreds are not candidates.
+        let counter = AtomicU64::new(0);
+        invoke(&coding_shreds[0], &counter);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "counter must not advance on coding shreds"
+        );
+        let mut buf = [0u8; 2048];
+        assert!(
+            multicast_receiver.recv_from(&mut buf).is_ok(),
+            "coding shred must still reach multicast"
+        );
+
+        // Data shred at counter 0 with seed=0 hits the drop position (splitmix64(0) % 2 == 0).
+        // It must be dropped from the turbine path but multicast must still see it,
+        // and the counter must advance to 1.
+        invoke(&data_shreds[0], &counter);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "counter must advance to 1 after one data shred"
+        );
+        assert!(
+            multicast_receiver.recv_from(&mut buf).is_ok(),
+            "data shred must still reach multicast even when dropped from turbine"
+        );
     }
 
     #[test]
