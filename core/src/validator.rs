@@ -18,7 +18,9 @@ use {
             tower_storage::{NullTowerStorage, TowerStorage},
         },
         forwarding_stage::ForwardingClientConfig,
-        multicast_shred_check_service::MulticastShredCheckService,
+        multicast_shred_check_service::{
+            MulticastShredCheckService, multicast_addresses_for_cluster,
+        },
         proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         repair::{
             self,
@@ -679,9 +681,10 @@ pub struct Validator {
     transaction_status_service: Option<TransactionStatusService>,
     entry_notifier_service: Option<EntryNotifierService>,
     system_monitor_service: Option<SystemMonitorService>,
-    /// Background watcher that keeps the cluster multicast shred address in sync
-    /// with kernel route availability.
-    multicast_shred_check_service: Option<MulticastShredCheckService>,
+    /// Background watchers that keep the cluster multicast shred addresses in
+    /// sync with kernel route availability. One per multicast group: the
+    /// leader-broadcast group and the turbine-root group.
+    multicast_shred_check_services: Vec<MulticastShredCheckService>,
     sample_performance_service: Option<SamplePerformanceService>,
     stats_reporter_service: StatsReporterService,
     gossip_service: GossipService,
@@ -1654,6 +1657,13 @@ impl Validator {
             None
         };
 
+        // Turbine-root multicast group, kept distinct from the leader-broadcast
+        // group (`config.multicast_receiver_address`). The retransmit stage
+        // forwards shreds to this address at the turbine root (root_distance == 0),
+        // so root-forwarded shreds never share a group with the leader's own shreds.
+        let multicast_root_receiver_address: Arc<ArcSwap<Option<SocketAddr>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+
         let tvu = Tvu::new(
             vote_account,
             authorized_voter_keypairs,
@@ -1731,7 +1741,7 @@ impl Validator {
             shredstream_receiver_address.clone(),
             config.shred_retransmit_receiver_addresses.clone(),
             bam_shred_receiver_addresses.clone(),
-            config.multicast_receiver_address.clone(),
+            multicast_root_receiver_address.clone(),
         )
         .map_err(ValidatorError::Other)?;
 
@@ -1853,18 +1863,29 @@ impl Validator {
             shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
         });
 
-        let multicast_shred_check_service = (!config.disable_multicast_shred_check
-            && matches!(
-                genesis_config.cluster_type,
-                ClusterType::MainnetBeta | ClusterType::Testnet
-            ))
-        .then(|| {
-            MulticastShredCheckService::new(
-                exit.clone(),
-                config.multicast_receiver_address.clone(),
-                genesis_config.cluster_type,
-            )
-        });
+        // One route watcher per multicast group: the leader-broadcast group
+        // (used by the broadcast stage) and the turbine-root group (used by the
+        // retransmit stage). They track independent kernel routes.
+        let multicast_shred_check_services = if config.disable_multicast_shred_check {
+            Vec::new()
+        } else {
+            multicast_addresses_for_cluster(genesis_config.cluster_type)
+                .map(|(leader_addr, root_addr)| {
+                    vec![
+                        MulticastShredCheckService::new(
+                            exit.clone(),
+                            config.multicast_receiver_address.clone(),
+                            leader_addr,
+                        ),
+                        MulticastShredCheckService::new(
+                            exit.clone(),
+                            multicast_root_receiver_address.clone(),
+                            root_addr,
+                        ),
+                    ]
+                })
+                .unwrap_or_default()
+        };
 
         Ok(Self {
             log_config: config.log_config.clone(),
@@ -1879,7 +1900,7 @@ impl Validator {
             transaction_status_service,
             entry_notifier_service,
             system_monitor_service,
-            multicast_shred_check_service,
+            multicast_shred_check_services,
             sample_performance_service,
             snapshot_packager_service,
             completed_data_sets_service,
@@ -2031,7 +2052,7 @@ impl Validator {
                 .expect("system_monitor_service");
         }
 
-        if let Some(multicast_shred_check_service) = self.multicast_shred_check_service {
+        for multicast_shred_check_service in self.multicast_shred_check_services {
             multicast_shred_check_service
                 .join()
                 .expect("multicast_shred_check_service");
